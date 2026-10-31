@@ -65,7 +65,7 @@ class FalconsGenericCompressor : public concepts::CompressorInterface<T> {
 #endif
 
         size_t bufferSize = std::max<size_t>(
-            1000, 1.2 * (decomposition.size_est() + encoder.size_est_without_init() + sizeof(T) * quant_inds_size));
+            1000, 1.2 * (decomposition.size_est() + encoder.size_est_without_init() + (sizeof(T) + 5) * quant_inds_size));
         auto buffer = static_cast<uchar *>(malloc(bufferSize));
         uchar *buffer_pos = buffer;
         auto cmpDataPos = cmpData;

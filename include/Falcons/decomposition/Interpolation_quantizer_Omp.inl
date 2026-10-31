@@ -181,7 +181,7 @@ namespace Falcons {
         }
         for (; i + 1 < odd_len; ++i) {
             size_t start = ((i << 1) + 1) * offset;
-            quantize_func(cur_ij_offset + start, data[cur_ij_offset + start],
+            quantize_point<CompMode, SkipOverwrite>(cur_ij_offset + start, data[cur_ij_offset + start],
                           interp_linear(data[cur_ij_offset + (i << 1) * offset],
                                         data[cur_ij_offset + ((i << 1) + 2) * offset]), tid);
         }
@@ -322,7 +322,7 @@ namespace Falcons {
         }
         for (; i + 3 < even_len; ++i) {
             size_t start = ((i << 1) + 3) * offset;
-            quantize_func(cur_ij_offset + start, data[cur_ij_offset + start],
+            quantize_point<CompMode, SkipOverwrite>(cur_ij_offset + start, data[cur_ij_offset + start],
                           interp_cubic(data[cur_ij_offset + (i << 1) * offset],
                                        data[cur_ij_offset + ((i << 1) + 2) * offset],
                                        data[cur_ij_offset + ((i << 1) + 4) * offset],
@@ -643,7 +643,7 @@ namespace Falcons {
             }
             for (; i + 3 < even_len; ++i) {
                 size_t start = ((i << 1) + 3) * offset;
-                quantize_func(cur_ij_offset + start, data[start],
+                quantize_point<CompMode, SkipOverwrite>(cur_ij_offset + start, data[start],
                               interp_cubic(buf[i], buf[i + 1], buf[i + 2], buf[i + 3]), tid);
             }
         }
@@ -726,7 +726,7 @@ namespace Falcons {
             }
             for (; i + 3 < even_len; ++i) {
                 size_t start = ((i << 1) + 3) * offset;
-                quantize_func(cur_ij_offset + start, data[start],
+                quantize_point<CompMode, SkipOverwrite>(cur_ij_offset + start, data[start],
                               interp_cubic(buf[i], buf[i + 1], buf[i + 2], buf[i + 3]), tid);
             }
         }
@@ -2676,9 +2676,26 @@ namespace Falcons {
         auto odd_len = len / 2;
         auto even_len = len - odd_len;
         size_t i = 0;
+        if constexpr (EnableInnerOmp) {
+            if (!legacy_stream) {  // same chunk-to-thread layout as the AVX lanes, so the streams interoperate
+                const size_t step = AVX_256_parallelism;
+                const size_t vec_chunks = odd_len > step ? (odd_len - 1) / step : 0;
+                #pragma omp parallel for
+                for (size_t chunk = 0; chunk < vec_chunks; ++chunk) {
+                    int cur_tid = omp_get_thread_num();
+                    for (size_t j = chunk * step; j < (chunk + 1) * step; ++j) {
+                        size_t start = ((j << 1) + 1) * offset;
+                        quantize_point<CompMode, SkipOverwrite>(cur_ij_offset + start, data[cur_ij_offset + start],
+                                      interp_linear(data[cur_ij_offset + (j << 1) * offset],
+                                                    data[cur_ij_offset + ((j << 1) + 2) * offset]), cur_tid);
+                    }
+                }
+                i = vec_chunks * step;
+            }
+        }
         for (; i + 1 < odd_len; ++i) {
             size_t start = ((i << 1) + 1) * offset;
-            quantize_func(cur_ij_offset + start, data[cur_ij_offset + start],
+            quantize_point<CompMode, SkipOverwrite>(cur_ij_offset + start, data[cur_ij_offset + start],
                           interp_linear(data[cur_ij_offset + (i << 1) * offset],
                                         data[cur_ij_offset + ((i << 1) + 2) * offset]), tid);
         }
@@ -2714,9 +2731,28 @@ namespace Falcons {
         quantize_point<CompMode, SkipOverwrite>(cur_ij_offset + offset, data[cur_ij_offset + offset], pred_first, tid);
 
         size_t i = 0;
+        if constexpr (EnableInnerOmp) {
+            if (!legacy_stream) {  // same chunk-to-thread layout as the AVX lanes, so the streams interoperate
+                const size_t step = AVX_256_parallelism;
+                const size_t vec_chunks = even_len > step + 2 ? (even_len - 3) / step : 0;
+                #pragma omp parallel for
+                for (size_t chunk = 0; chunk < vec_chunks; ++chunk) {
+                    int cur_tid = omp_get_thread_num();
+                    for (size_t j = chunk * step; j < (chunk + 1) * step; ++j) {
+                        size_t start = ((j << 1) + 3) * offset;
+                        quantize_point<CompMode, SkipOverwrite>(cur_ij_offset + start, data[cur_ij_offset + start],
+                                      interp_cubic(data[cur_ij_offset + (j << 1) * offset],
+                                                   data[cur_ij_offset + ((j << 1) + 2) * offset],
+                                                   data[cur_ij_offset + ((j << 1) + 4) * offset],
+                                                   data[cur_ij_offset + ((j << 1) + 6) * offset]), cur_tid);
+                    }
+                }
+                i = vec_chunks * step;
+            }
+        }
         for (; i + 3 < even_len; ++i) {
             size_t start = ((i << 1) + 3) * offset;
-            quantize_func(cur_ij_offset + start, data[cur_ij_offset + start],
+            quantize_point<CompMode, SkipOverwrite>(cur_ij_offset + start, data[cur_ij_offset + start],
                           interp_cubic(data[cur_ij_offset + (i << 1) * offset],
                                        data[cur_ij_offset + ((i << 1) + 2) * offset],
                                        data[cur_ij_offset + ((i << 1) + 4) * offset],

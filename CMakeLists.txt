@@ -4,7 +4,7 @@ project(Falcons VERSION 1.0.0)
 #data version defines the version of the compressed data format
 #it is not always equal to the program version (e.g., Falcons v3.1.0 and Falcons v.3.1.1 may use the same data version of v.3.1.0)
 #only update data version if the new version of the program changes compressed data format
-set(Falcons_DATA_VERSION 1.0.0)
+set(Falcons_DATA_VERSION 1.0.1)
 
 include(GNUInstallDirs)
 

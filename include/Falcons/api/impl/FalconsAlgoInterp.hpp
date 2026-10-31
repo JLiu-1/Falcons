@@ -48,7 +48,8 @@ size_t Falcons_compress_Interp(Config &conf, T *data, uchar *cmpData, size_t cmp
 #endif
     #ifdef _OPENMP
     int threads = omp_get_max_threads();
-    if (threads > 1 && conf.openmp) {
+    // Integers take the serial path: LinearQuantizerOMP has no overflow-safe integer arithmetic.
+    if (threads > 1 && conf.openmp && std::is_floating_point_v<T>) {
         auto falcons = make_compressor_falcons_generic_omp<T, N>(
         make_decomposition_interpolation_omp<T, N>(conf, LinearQuantizerOMP<T>(conf.absErrorBound, conf.quantbinCnt / 2)),
         RleFseEncoder<int16_t>(),  Lossless_zstd());
@@ -68,14 +69,20 @@ size_t Falcons_compress_Interp(Config &conf, T *data, uchar *cmpData, size_t cmp
 
 }
 
+// The OMP layout starts with [int streams][size_t offsets[0] == 0]. A serial stream has its zstd frame
+// at byte 8. The layout decides the decoder; the caller's thread count must not.
+inline bool Falcons_stream_is_omp(const Config &conf, const uchar *cmpData, size_t cmpSize) {
+    static const uchar zeros[8] = {0};
+    return conf.openmp && cmpSize >= 12 && memcmp(cmpData + 4, zeros, 8) == 0;
+}
+
 template <class T, uint N>
 void Falcons_decompress_Interp(const Config &conf, const uchar *cmpData, size_t cmpSize, T *decData) {
     assert(conf.cmprAlgo == ALGO_INTERP);
     auto cmpDataPos = cmpData;
    // std::cout<<"decomp started"<<std::endl;
     #ifdef _OPENMP
-    int threads = omp_get_max_threads();
-    if (threads > 1 && conf.openmp) {
+    if (Falcons_stream_is_omp(conf, cmpData, cmpSize)) {
     auto falcons = make_compressor_falcons_generic_omp<T, N>(
         make_decomposition_interpolation_omp<T, N>(conf, LinearQuantizerOMP<T>(conf.absErrorBound, conf.quantbinCnt / 2)),
         RleFseEncoder<int16_t>(), Lossless_zstd());
@@ -88,6 +95,8 @@ void Falcons_decompress_Interp(const Config &conf, const uchar *cmpData, size_t 
          falcons->decompress(conf, cmpDataPos, cmpSize, decData);
     }
     #else
+    if (Falcons_stream_is_omp(conf, cmpData, cmpSize))
+        throw std::invalid_argument("This Falcons stream was written with -P, rebuild Falcons with OpenMP to read it");
     auto falcons = make_compressor_falcons_generic<T, N>(
         make_decomposition_interpolation<TUNING::DISABLED, T, N>(conf, LinearQuantizer<T>(conf.absErrorBound, conf.quantbinCnt / 2)),
         RleFseEncoder<int16_t>(), Lossless_zstd());

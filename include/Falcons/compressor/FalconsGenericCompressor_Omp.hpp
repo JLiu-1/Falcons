@@ -52,6 +52,9 @@ class FalconsGenericCompressor_OMP : public concepts::CompressorInterface<T> {
 #ifdef Falcons_PRINT_TIMINGS
         Timer timer(true);
 #endif
+#ifdef _OPENMP
+        omp_set_dynamic(0);   // every parallel region must see the same team
+#endif
         auto [local_quant_inds, local_quant_index] = decomposition.compress(conf, data);
 #ifdef Falcons_PRINT_TIMINGS
         timer.stop("cmp interp");
@@ -63,7 +66,8 @@ class FalconsGenericCompressor_OMP : public concepts::CompressorInterface<T> {
         #ifdef _OPENMP
         auto default_nthreads = omp_get_max_threads();
         //std::cout<<default_nthreads<<" "<<quant_inds_size<<std::endl;
-        auto best_num_threads = default_nthreads;// std::min(default_nthreads, static_cast<int>(quant_inds_size / (1u<<16)));
+        // One stream per thread that really filled one: the decomposition's team can be smaller.
+        auto best_num_threads = decomposition.num_threads();
         //std::cout<<best_num_threads<<std::endl;
         if (best_num_threads > 1) {
             // size_t cur_bufferSize = std::max<size_t>(1000, 2 * 1.2 * sizeof(T) * local_quant_index[0].value * best_num_threads);
@@ -78,6 +82,7 @@ class FalconsGenericCompressor_OMP : public concepts::CompressorInterface<T> {
             int nthreads = best_num_threads;
             size_t offset_chunk_size = nthreads * sizeof (size_t);
             size_t total_zstd_size = 0;
+            bool fits_cmpCap = true;
             block_byte_offsets.resize(nthreads);
             write<int>(nthreads, cmpDataPos);
             // Timer timer1(true);
@@ -92,7 +97,9 @@ class FalconsGenericCompressor_OMP : public concepts::CompressorInterface<T> {
                 // auto temp_buffer_pos0 = buffer_pos + tid * sizeof(int);
                 // decomposition.save3(temp_buffer_pos0, tid);
                 // write<int>(local_quant_index[tid].value, temp_buffer_pos0);
-                size_t cur_bufferSize = std::max<size_t>(1000, 1.2 * (cur_encoder.size_est_without_init() + sizeof(T) * local_quant_index[tid].value));
+                // Outliers are stored raw on top of their codes, and anchors have no code at all.
+                size_t cur_bufferSize = std::max<size_t>(1000, 1.2 * (cur_encoder.size_est_without_init() + 4096 +
+                    (sizeof(T) + 2) * local_quant_index[tid].value + sizeof(T) * decomposition.local_unpred_count(tid)));
                 auto cur_buffer = static_cast<uchar *>(malloc(cur_bufferSize)); 
                 // uchar* cur_buffer = new (std::align_val_t(64)) uchar[cur_bufferSize];
                 // auto cur_buffer = buffer + tid * cur_bufferSize;
@@ -126,11 +133,14 @@ class FalconsGenericCompressor_OMP : public concepts::CompressorInterface<T> {
                         prefix_sum =  prefix_sum + tmp;
                     }
                     total_zstd_size =  prefix_sum;
+                    fits_cmpCap = (cmpDataPos - cmpData) + offset_chunk_size + total_zstd_size <= cmpCap;
                 }
-                auto temp_cmpData_pos = cmpDataPos + tid * sizeof(size_t);
-                write<size_t>(block_byte_offsets[tid],temp_cmpData_pos);
-                temp_cmpData_pos = cmpDataPos + offset_chunk_size + block_byte_offsets[tid];
-                write<uchar>(lossless_buffer, lossless_outSize,  temp_cmpData_pos);
+                if (fits_cmpCap) {
+                    auto temp_cmpData_pos = cmpDataPos + tid * sizeof(size_t);
+                    write<size_t>(block_byte_offsets[tid],temp_cmpData_pos);
+                    temp_cmpData_pos = cmpDataPos + offset_chunk_size + block_byte_offsets[tid];
+                    write<uchar>(lossless_buffer, lossless_outSize,  temp_cmpData_pos);
+                }
 
                 free(lossless_buffer);
                 free(cur_buffer);
@@ -138,6 +148,7 @@ class FalconsGenericCompressor_OMP : public concepts::CompressorInterface<T> {
             }
             // free(buffer);
             omp_set_num_threads(default_nthreads);
+            if (!fits_cmpCap) throw std::length_error(Falcons_ERROR_COMP_BUFFER_NOT_LARGE_ENOUGH);
             cmpDataPos += offset_chunk_size + total_zstd_size;
         }
             
@@ -211,6 +222,19 @@ class FalconsGenericCompressor_OMP : public concepts::CompressorInterface<T> {
         //lossless.decompress(cmpData, cmpSize, buffer, bufferSize);
         // read(huffSize, cmpDataPos);
         read(compression_thread_num, cmpDataPos);
+        // The stream fixes the team: every thread owns one code stream, whatever the caller's setting.
+        const int caller_threads = omp_get_max_threads();
+        omp_set_dynamic(0);
+        omp_set_num_threads(compression_thread_num);
+        int team = 1;
+        #pragma omp parallel
+        #pragma omp single
+        team = omp_get_num_threads();
+        if (team != compression_thread_num) {
+            omp_set_num_threads(caller_threads);
+            throw std::runtime_error("this Falcons stream needs " + std::to_string(compression_thread_num) +
+                                     " OpenMP threads but only " + std::to_string(team) + " are available");
+        }
         int16_t** local_quant_inds = new int16_t*[compression_thread_num];
         int* local_quant_index = new int[compression_thread_num];
         decomposition.init_local_unpred(compression_thread_num);
@@ -279,6 +303,7 @@ class FalconsGenericCompressor_OMP : public concepts::CompressorInterface<T> {
         timer.start();
 #endif
         decomposition.decompress(conf, local_quant_inds, decData);
+        omp_set_num_threads(caller_threads);
 #ifdef Falcons_PRINT_TIMINGS
     timer.stop("decomp interp");
 #endif

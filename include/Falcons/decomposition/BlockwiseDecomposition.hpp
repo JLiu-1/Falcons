@@ -85,6 +85,9 @@ class BlockwiseDecomposition : public concepts::DecompositionInterface<T, int, N
 
     std::pair<int, int> get_out_range() override { return quantizer.get_out_range(); }
 
+    // Outliers, plus room for the predictors' saved tables on small inputs.
+    size_t size_est() override { return quantizer.size_est() + (1 << 20); }
+
    private:
     Predictor predictor;
     Quantizer quantizer;

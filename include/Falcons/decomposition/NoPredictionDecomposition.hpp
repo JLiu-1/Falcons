@@ -16,20 +16,22 @@ class NoPredictionDecomposition : public concepts::DecompositionInterface<T, int
     }
 
     T *decompress(const Config &conf, int* quant_inds, T *dec_data) override {
+        const int radius = quantizer.get_out_range().second / 2;
         for (size_t i = 0; i < conf.num; i++) {
-            dec_data[i] = quantizer.recover(0, quant_inds[i]);
+            dec_data[i] = quantizer.recover(0, quant_inds[i] - radius);
         }
         quantizer.postdecompress_data();
         return dec_data;
     }
 
     std::tuple<int*, uint64_t> compress(const Config &conf, T *data) override {
-        std::vector<int> quant_inds(conf.num);
+        int *quant_inds = new int[conf.num];   // released by the generic compressor
+        const int radius = quantizer.get_out_range().second / 2;   // Huffman needs codes in [0, 2 * radius)
         for (size_t i = 0; i < conf.num; i++) {
-            quant_inds[i] = quantizer.quantize_and_overwrite(data[i], 0);
+            quant_inds[i] = quantizer.quantize_and_overwrite(data[i], 0) + radius;
         }
         quantizer.postcompress_data();
-        return {quant_inds.data(), static_cast<uint64_t>(quant_inds.size())};
+        return {quant_inds, static_cast<uint64_t>(conf.num)};
     }
 
     void save(uchar *&c) override { quantizer.save(c); }

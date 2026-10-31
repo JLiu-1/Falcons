@@ -34,6 +34,17 @@ class LinearQuantizerOMP : public concepts::QuantizerOMPInterface<T, int> {
 
     double get_eb() const { return error_bound; }
 
+    void set_legacy_unfused(bool legacy) { legacy_unfused = legacy; }
+
+    // Must match the fused AVX lanes and the serial LinearQuantizer on every path.
+    ALWAYS_INLINE T dequantize(T pred, int quant_index) const {
+        if constexpr (std::is_floating_point_v<T>) {
+            if (!legacy_unfused)
+                return static_cast<T>(std::fma(static_cast<double>(quant_index), this->double_error_bound, static_cast<double>(pred)));
+        }
+        return pred + quant_index * this->double_error_bound;
+    }
+
     ALWAYS_INLINE std::tuple<double, double, double> get_all_eb() const { return {error_bound, double_error_bound, double_error_bound_reciprocal}; }
 
     void set_eb(double eb) {
@@ -54,7 +65,7 @@ class LinearQuantizerOMP : public concepts::QuantizerOMPInterface<T, int> {
             //if (diff < 0)
             //    quant_index = -quant_index;
             //auto quant_index_shifted = this->radius + quant_index;
-            T decompressed_data = pred + quant_index * this->double_error_bound;
+            T decompressed_data = dequantize(pred, quant_index);
             // if data is NaN, the error is NaN, and NaN <= error_bound is false
             T err = decompressed_data - data;
             if (err >= -this->error_bound && err <= this->error_bound) {
@@ -78,7 +89,7 @@ class LinearQuantizerOMP : public concepts::QuantizerOMPInterface<T, int> {
             //if (diff < 0)
             //    quant_index = -quant_index;
             //auto quant_index_shifted = this->radius + quant_index;
-            T decompressed_data = pred + quant_index * this->double_error_bound;
+            T decompressed_data = dequantize(pred, quant_index);
             // if data is NaN, the error is NaN, and NaN <= error_bound is false
             T err = decompressed_data - data;
             if (err >= -this->error_bound && err <= this->error_bound) {
@@ -98,7 +109,7 @@ class LinearQuantizerOMP : public concepts::QuantizerOMPInterface<T, int> {
         T diff = data - pred;
         int quant_index = static_cast<int>(std::nearbyint(diff * this->double_error_bound_reciprocal));
         if (quant_index > -this->radius && quant_index < this->radius ) {
-            T decompressed_data = pred + quant_index * this->double_error_bound;
+            T decompressed_data = dequantize(pred, quant_index);
             T err = decompressed_data - data;
             if (err >= -this->error_bound && err <= this->error_bound) {
                 return quant_index;
@@ -124,12 +135,12 @@ class LinearQuantizerOMP : public concepts::QuantizerOMPInterface<T, int> {
 
 
     ALWAYS_INLINE T recover_pred(T pred, int quant_index) {
-        return pred + quant_index * this->double_error_bound;   // int16: no -radius
+        return dequantize(pred, quant_index);   // int16: no -radius
     }
 
     ALWAYS_INLINE T recover_unpred() { return unpred[index++]; }
     ALWAYS_INLINE T recover_unpred2(int tid) { return local_unpred[tid][local_unpred_idx[tid].value++]; }
-    ALWAYS_INLINE void init_local_unpred(int thread_count, int each_num) {
+    ALWAYS_INLINE void init_local_unpred(int thread_count, size_t each_num) {
         #ifdef _OPENMP
             // local_unpred = new T*[thread_count];
             // local_unpred_idx = new CacheLineInt[thread_count];
@@ -192,6 +203,8 @@ class LinearQuantizerOMP : public concepts::QuantizerOMPInterface<T, int> {
         #endif
         return 0;
     }
+
+    size_t local_unpred_count(int tid) const { return local_unpred_idx[tid].value; }
 
     ALWAYS_INLINE int save_unpred2(T ori, int tid){
         //local_unpred[tid].emplace_back(ori);
@@ -320,6 +333,7 @@ class LinearQuantizerOMP : public concepts::QuantizerOMPInterface<T, int> {
     double double_error_bound;
     double double_error_bound_reciprocal;
     int radius;  // quantization interval radius
+    bool legacy_unfused = false;  // reading a 1.0.0 stream
 };
 
 }  // namespace Falcons

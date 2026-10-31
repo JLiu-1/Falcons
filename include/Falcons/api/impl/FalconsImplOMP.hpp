@@ -142,7 +142,7 @@ void Falcons_decompress_OMP(Config& conf, const uchar* cmpData, size_t cmpSize, 
     if (conf_t[0].falconsMagicNumber != Falcons_MAGIC_NUMBER) {
         throw std::invalid_argument("magic number mismatch, the input data is not compressed by Falcons");
     }
-    if (versionStr(conf_t[0].falconsDataVer) != Falcons_DATA_VER) {
+    if (!versionReadable(conf_t[0].falconsDataVer)) {
         std::stringstream ss;
         printf("program v%s , program-data %s , input data v%s\n", Falcons_VER, Falcons_DATA_VER,
                versionStr(conf_t[0].falconsDataVer).data());

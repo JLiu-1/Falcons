@@ -56,12 +56,15 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
         auto default_nThreads = omp_get_max_threads();
         //std::cout<<"max threads: "<<default_nThreads<<std::endl;
 
+        legacy_stream = conf.falconsDataVer != versionInt(Falcons_DATA_VER);
+        quantizer.set_legacy_unfused(legacy_stream);
+
         size_t max_usable_threads = default_nThreads;
         for (uint i = 1; i < N; ++i)
             max_usable_threads = std::min(max_usable_threads, original_dimensions[i]);
         omp_set_num_threads(max_usable_threads);
 
-        nThreads = omp_get_max_threads(); // for safety
+        nThreads = actual_team_size();
         //std::cout<<"used threads: "<<nThreads<<std::endl;
 
         if constexpr (N != 1) {
@@ -207,7 +210,7 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
             max_usable_threads = std::min(max_usable_threads, original_dimensions[i]);
         omp_set_num_threads(max_usable_threads);
 
-        nThreads = omp_get_max_threads(); // for safety
+        nThreads = actual_team_size();
         if constexpr (N != 1) {
 #ifdef __ARM_FEATURE_SVE2
             buffer_len = max_dim +  2 * SVE2_parallelism - max_dim % SVE2_parallelism;
@@ -236,7 +239,11 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
         int16_t** local_quant_inds_vec = new int16_t*[nThreads];
         CacheLineInt* local_quant_index_vec = new CacheLineInt[nThreads];
 
-        int each_num = (num_elements / nThreads) << (nThreads == 1 ? 0 : 2);
+        // A schedule can load one thread far beyond the average when an outer dimension is short.
+        // Per sweep a thread gets at most pts/T + pts/c points for an outer loop of c iterations,
+        // and summed over levels the pts/c part stays below 8 * num / (shortest dimension).
+        size_t shortest_dim = *std::min_element(original_dimensions.begin(), original_dimensions.end());
+        size_t each_num = std::min(num_elements, (num_elements / nThreads) * 4 + 8 * (num_elements / shortest_dim) + 256);
         quantizer.init_local_unpred(nThreads, each_num);
 
         constexpr size_t alignment = 64;          // cache line alignment
@@ -433,7 +440,21 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
     }
     std::pair<int, int> get_out_range() override { return quantizer.get_out_range(); }
 
+    int num_threads() const { return static_cast<int>(nThreads); }
+    size_t local_unpred_count(int tid) const { return quantizer.local_unpred_count(tid); }
+
    private:
+    // The team OpenMP really delivers, which can be below the request (e.g. OMP_THREAD_LIMIT).
+    // Fixing it here keeps the stream layout equal to the team that fills it.
+    static size_t actual_team_size() {
+        int team = 1;
+        #pragma omp parallel
+        #pragma omp single
+        team = omp_get_num_threads();
+        omp_set_num_threads(team);
+        return team;
+    }
+
     template <COMPMODE CompMode, bool SkipOverwrite>
     ALWAYS_INLINE void quantize_point(size_t idx, T &d, T pred, int tid) {
         (void)idx;
@@ -3153,8 +3174,11 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
         ebx2_avx = _mm256_set1_pd(real_ebx2);
 
         if constexpr (std::is_same_v<T, float>) {
-            rel_eb_avx_f = _mm256_set1_ps(real_eb);
-            nrel_eb_avx_f = _mm256_set1_ps(-real_eb);
+            // Round toward zero: for a float err, err <= eb_f then holds exactly when err <= eb.
+            float eb_f = static_cast<float>(real_eb);
+            if (static_cast<double>(eb_f) > real_eb) eb_f = std::nextafter(eb_f, 0.0f);
+            rel_eb_avx_f = _mm256_set1_ps(eb_f);
+            nrel_eb_avx_f = _mm256_set1_ps(-eb_f);
         }
         else if constexpr (std::is_same_v<T, double>) {
             rel_eb_avx_d = _mm256_set1_pd(real_eb);
@@ -3268,6 +3292,16 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
                 strides[dims[i]] = stride2x;
             }
             if constexpr (N == 3 && !std::is_integral_v<T>){//avx
+                if (direction != 0 && direction != 5) {  // the SIMD sweeps only cover xyz and zyx
+                    predict_error += interpolation_1d_fastest_dim_first(data, begin_idx, end_idx, dims[0], strides, stride, interp_func, quantize_func);
+                    for (uint i = 1; i < N; ++i) {
+                        begin_idx[dims[i]] = begin[dims[i]];
+                        begin_idx[dims[i - 1]] = (begin[dims[i - 1]] ? begin[dims[i - 1]] + stride : 0);
+                        strides[dims[i - 1]] = stride;
+                        predict_error += interpolation_1d_fastest_dim_first(data, begin_idx, end_idx, dims[i], strides, stride, interp_func, quantize_func);
+                    }
+                    return predict_error;
+                }
                 if(direction == 0 ){//xyz
                     predict_error += interpolation_1d_simd_3d_z<CompMode, false>(data, begin_idx, end_idx, dims[0], strides, stride, interp_func, quantize_func);
                     begin_idx[1] = begin[1];
@@ -3340,6 +3374,7 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
 
     size_t max_dim = 1;
     size_t nThreads = 1;
+    bool legacy_stream = false;  // reading a 1.0.0 stream
     size_t buffer_len = 1024;
     T *interp_buffer_1 = nullptr;
     T *interp_buffer_2 = nullptr;

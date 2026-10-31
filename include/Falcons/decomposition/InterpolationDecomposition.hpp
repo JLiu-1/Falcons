@@ -2302,8 +2302,11 @@ class InterpolationDecomposition : public concepts::DecompositionInterface<T, in
         ebx2_r_avx = _mm256_set1_pd(real_ebx2_r);
         ebx2_avx = _mm256_set1_pd(real_ebx2);
         if constexpr (std::is_same_v<T, float>) {
-            rel_eb_avx_f = _mm256_set1_ps(real_eb);
-            nrel_eb_avx_f = _mm256_set1_ps(-real_eb);
+            // Round toward zero: for a float err, err <= eb_f then holds exactly when err <= eb.
+            float eb_f = static_cast<float>(real_eb);
+            if (static_cast<double>(eb_f) > real_eb) eb_f = std::nextafter(eb_f, 0.0f);
+            rel_eb_avx_f = _mm256_set1_ps(eb_f);
+            nrel_eb_avx_f = _mm256_set1_ps(-eb_f);
         }
         else if constexpr (std::is_same_v<T, double>) {
             rel_eb_avx_d = _mm256_set1_pd(real_eb);
@@ -2403,6 +2406,16 @@ class InterpolationDecomposition : public concepts::DecompositionInterface<T, in
             if constexpr (Tuning == TUNING::DISABLED && N == 3 && !std::is_integral_v<T>) {//avx &&stride<=2
                 constexpr bool _fuse = false;      // x+y cache fusion, always on (set false to use the old path below)
                 constexpr size_t _fuse_tile = 1;     // z-slab thickness (planes); 1 is optimal
+                if (direction != 0 && direction != 5) {  // the SIMD sweeps only cover xyz and zyx
+                    predict_error += interpolation_1d_fastest_dim_first(data, begin_idx, end_idx, dims[0], strides, stride, interp_func, quantize_func);
+                    for (uint i = 1; i < N; i++) {
+                        begin_idx[dims[i]] = begin[dims[i]];
+                        begin_idx[dims[i - 1]] = (begin[dims[i - 1]] ? begin[dims[i - 1]] + stride : 0);
+                        strides[dims[i - 1]] = stride;
+                        predict_error += interpolation_1d_fastest_dim_first(data, begin_idx, end_idx, dims[i], strides, stride, interp_func, quantize_func);
+                    }
+                    return predict_error;
+                }
                 if(direction ==0 ){//xyz
                     // constexpr bool _fuse_xyz = true;   // OFF: z done as a separate pass; keep only xy-line fusion
                     std::array<size_t, N> bz = begin_idx, sz0 = strides;   // z-pass config (kept before the y mutations)

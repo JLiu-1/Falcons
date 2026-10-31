@@ -14,7 +14,7 @@ Executables land in `[INSTALL_DIR]/bin`, headers in `[INSTALL_DIR]/include`.
 **SIMD / AVX2**
 * `-DENABLE_AVX2=ON` turns on the AVX2 code paths (x86, needs CPU support) — a large speedup.
 * On ARM use `-DENABLE_SVE2=ON` instead.
-* With neither flag you get a portable scalar build. **Scalar, AVX2 and SVE2 all produce bit-identical output.**
+* With neither flag you get a portable scalar build. **Scalar and AVX2 builds produce byte-identical streams**, and any stream decodes in either build at any thread count. SVE2 is untested in this respect; see [docs/cpu-closed-loop-fixes.md](docs/cpu-closed-loop-fixes.md).
 * The SIMD flag is attached to the `Falcons` CMake target, so **everything that links `Falcons` inherits it automatically** — the `falcons` binary and the HDF5 filter. You only set it once, at configure time.
 
 **Optional components**
