@@ -1,0 +1,6 @@
+*.o
+fgpu_decode
+fgpu_bench
+fgpu_difftest
+fgpu_difftest_scalar
+fgpu_compress

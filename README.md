@@ -51,6 +51,29 @@ This branch makes compression and decompression close the loop across AVX2 and s
 * The SVE2 path was not tested or changed.
 * A `-P` stream cannot hold more than 2^31 codes per thread.
 
+## Changes on branch `feature/gpu-codec`
+
+This branch adds the GPU codec on top of the CPU fixes in `fix/cpu-omp-bugs`. It only adds the `gpu/` directory, and the CPU library stays the same as on that branch.
+
+### Why
+
+The goal is to decompress Falcons data on the GPU without giving up compatibility: data compressed on the CPU has to decompress on the GPU to the same bits, and data compressed on the GPU has to decompress on the CPU. Bit-exact results matter because the compressor checks its error bound against its own exact reconstruction, so a drift of 1 ULP could propagate through the interpolation levels. Moving streams between builds and thread counts relies on the CPU fixes above.
+
+### What was added
+
+| Written by | Read by | Guarantee |
+| --- | --- | --- |
+| CPU | GPU | Output byte-identical to the CPU decoder |
+| GPU hybrid | CPU, GPU | Stream byte-identical to the CPU compressor's |
+| GPU pure | CPU, GPU | Valid stream with the same quantization codes, so the same decoded values |
+
+* `fgpu_decode` and `fgpu_compress` are the command-line tools. `pure` runs everything but the container handling on the GPU, and `hybrid` keeps entropy coding on the CPU.
+* `-m auto` chooses per stream. Lorenzo/regression, no-prediction and lossless streams fall back to the CPU decoder.
+* GPU compression covers float and double interpolation, without the CPU's automatic tuning.
+* `fgpu_difftest` checks every direction against the CPU library byte for byte.
+
+[gpu/README.md](gpu/README.md) has the build steps, usage, design, performance numbers and limits. The codec builds separately with its own Makefile and needs CUDA 12.8 or newer.
+
 ## Build & install
 
 ```bash
