@@ -1,5 +1,56 @@
 # Falcons: Pushing the Speed-Ratio Limits of Lossy Compression for Parallel Scientific Applications
 
+## Changes on this branch (`fix/cpu-omp-bugs`)
+
+### Why
+
+In upstream Falcons, a compressed stream could fail to decompress, or decompress to wrong data without an error, when the decompressing setup differed from the compressing one. The affected differences are the OpenMP thread count and the AVX2 versus scalar build. Some configurations also exceeded the error bound or crashed during compression. For example, a `-P` stream compressed with 32 threads decompressed to wrong data with 16 threads and crashed with 64.
+
+This branch makes compression and decompression close the loop across AVX2 and scalar builds at any thread count, with as few code and structural changes as possible.
+
+### What changed
+
+| Problem | Effect before | Fix |
+| --- | --- | --- |
+| Decompression used the caller's thread count, not the stream's | Wrong data or crash | Thread count now comes from the stream, and the decoder is chosen by stream layout (`Falcons_stream_is_omp`) |
+| Per-thread buffer bound `(num / T) * 4` was too small on skewed shapes | Error bound exceeded (0.118 against 0.01), crashes | Bound now accounts for the shortest dimension, and `each_num` is `size_t` |
+| Threads greater than `min(dims[1..])` | Compression crash | Encoding uses the decomposition's actual team size, and `omp_set_dynamic` is turned off |
+| OMP quantizer mixed fused and unfused arithmetic | AVX2 and scalar results differed | Floating-point types always use `fma` |
+| 1D `-P` stream layout depended on the build | AVX2 and scalar could not read each other's streams | Scalar path uses the same chunk layout as AVX2 |
+| AVX2 lanes compared errors against `float(eb)` | AVX2 and scalar accepted different values | The float bound is rounded toward zero |
+| `SkipOverwrite` ignored in line kernels | Different data stored on the lossless fallback | Loops use `quantize_point<CompMode, SkipOverwrite>` |
+| `ALGO_NOPRED` used a dangling pointer and had no `+radius` bias | Unusable, crashes | Buffer is allocated with `new int[]`, and the bias is applied both ways |
+| Buffer estimates left out outliers and predictor tables | Heap overflow in Lorenzo/regression paths | Estimates added, and OMP output is checked against `cmpCap` |
+| 3D directions 1-4 reached the wrong dimensions | Heap corruption or exceeded bound | They now use `interpolation_1d_fastest_dim_first` |
+| Integer `-P` subtraction wrapped around | Error bound exceeded | Integer types use the serial compression path |
+
+[docs/cpu-closed-loop-fixes.md](docs/cpu-closed-loop-fixes.md) has the cause and fix of each problem, in Chinese.
+
+### Compatibility
+
+* The data version is now 1.0.1. Older binaries refuse the new streams.
+* Version 1.0.0 streams stay readable, and decode to the same bits as with the old binary.
+* Version 1.0.0 1D `-P` streams can still only be read by the kind of build that wrote them (AVX2 or scalar).
+
+### Behavior changes
+
+* If fewer threads are available than the stream has (for example because of `OMP_THREAD_LIMIT`), decompression raises an exception instead of decoding wrong data.
+* Integer `-P` compression no longer runs in parallel.
+
+### Verification
+
+`tools/test/test_closed_loop.cpp` runs randomized configurations covering all algorithms, 8 data types, 1-4 dimensions, 1-100 threads, all directions, and smooth, noisy, constant, spiky and NaN/Inf data.
+
+* 1000 configurations compressed by each build and decompressed by both builds at 5 thread counts: 20000 runs, 0 failures.
+* AddressSanitizer: 500 compressions and 2500 decompressions, 0 failures.
+* AVX2 and scalar compressed output: 1000 of 1000 byte-identical.
+
+### Not fixed
+
+* `Falcons_compress` takes a `const T*` but rewrites the input in place, and the lossless fallback stores the rewritten data. That fallback is therefore within the error bound, not strictly lossless.
+* The SVE2 path was not tested or changed.
+* A `-P` stream cannot hold more than 2^31 codes per thread.
+
 ## Build & install
 
 ```bash
