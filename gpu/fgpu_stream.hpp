@@ -145,11 +145,20 @@ HostStreams<T> decode_streams(const Falcons::Config &conf, const unsigned char *
 
 // Shared by the GPU compressors: resolves the config and builds the plan.
 template <class T>
-Falcons::Config prepare_compress(const Falcons::Config &config, const T *data, int streams, PlanParams &pp) {
+Falcons::Config prepare_compress(const Falcons::Config &config, const T *data, int streams, PlanParams &pp, const void *deviceData = nullptr) {
     using namespace Falcons;
     Config conf(config);
     conf.openmp = conf.openmp || streams > 1;
-    calAbsErrorBound(conf, data);
+    if (!deviceData || conf.errorBoundMode == EB_ABS || conf.errorBoundMode == EB_L2NORM) {
+        calAbsErrorBound(conf, data);   // these two modes never read the array
+    } else {
+        // A nonzero range replaces the scan of the array. Zero does not, so it gets one element to scan.
+        const size_t num = conf.num;
+        const T zero = 0;
+        conf.num = 1;
+        calAbsErrorBound(conf, &zero, static_cast<T>(device_range(deviceData, num, sizeof(T))));
+        conf.num = num;
+    }
     if (conf.interpAnchorStride < 0) {
         std::array<size_t, 4> strides = {4096, 128, 32, 16};
         conf.interpAnchorStride = strides[conf.N - 1];
@@ -226,12 +235,13 @@ inline std::vector<char> join_blocks(const Falcons::Config &config, const PlanPa
 
 // Pure-GPU compression. A valid stream for every Falcons decoder, not byte-equal to the CPU's because
 // the zstd layer is stored raw. Empty when the data is nearly incompressible; use the CPU then.
+// With deviceData the array is read from device memory and left unchanged, and data may be null.
 template <class T>
 std::vector<char> compress_pure_stream(const Falcons::Config &config, const T *data, int streams, int o1Chains = 4, PureCompressOutput *times = nullptr,
                                        const void *deviceData = nullptr) {
     using namespace Falcons;
     PlanParams pp;
-    Config conf = prepare_compress<T>(config, data, streams, pp);
+    Config conf = prepare_compress<T>(config, data, streams, pp, deviceData);
     Plan plan = build_plan(pp);
     PureCompressInput in;
     in.plan = &plan;
@@ -257,6 +267,9 @@ std::vector<char> compress_pure_stream(const Falcons::Config &config, const T *d
 // Hybrid compression: prediction and quantization on the GPU, encoding on the CPU with the very same
 // encoder, so the result equals the CPU compressor's stream byte for byte.
 // streams > 1 writes the -P layout, streams == 1 the serial layout. conf.cmprAlgo must be ALGO_INTERP.
+// Empty when the data is nearly incompressible. deviceData works as in compress_pure_stream, and with
+// a relative bound on data holding NaNs the stream can differ from the CPU's, whose range depends on where they fall.
+// scratch keeps the 2 bytes per point of host memory between calls, which is worth it when compressing repeatedly.
 template <class T>
 std::vector<char> encode_on_cpu(const Falcons::Config &conf, const PlanParams &pp, const Plan &plan, CompressOutput &co, int streams) {
     using namespace Falcons;
@@ -267,14 +280,20 @@ std::vector<char> encode_on_cpu(const Falcons::Config &conf, const PlanParams &p
         abase[t + 1] = abase[t] + plan.anchorLen[t];
         ebase[t + 1] = std::lower_bound(co.escPos.begin(), co.escPos.end(), base[t + 1]) - co.escPos.begin();
     }
-    std::vector<std::vector<uchar>> blocks(K);
+    std::vector<std::vector<uchar, NoInit<uchar>>> blocks(K);
     std::vector<size_t> sizes(K);
     const int radius = conf.quantbinCnt / 2;
     const auto header = interp_header(conf, streams, radius);
 #pragma omp parallel for schedule(dynamic)
     for (int t = 0; t < K; ++t) {
         const size_t n = plan.streamLen[t], nun = plan.anchorLen[t] + (ebase[t + 1] - ebase[t]);
-        std::vector<uchar> buf(4096 + 8 * n + (2 * sizeof(T) + 8) * nun + 2 * RleFseEncoder<int16_t>().size_est_without_init());
+        // Kept per thread: only the pages written stay resident, and faulting them in each call is slow.
+        static thread_local std::vector<uchar, NoInit<uchar>> buf;
+        const size_t need = 4096 + 8 * n + (2 * sizeof(T) + 8) * nun + 2 * RleFseEncoder<int16_t>().size_est_without_init();
+        if (buf.size() < need) {
+            buf = {};
+            buf.resize(need);
+        }
         uchar *p = buf.data();
         if (t == K - 1) {
             std::memcpy(p, header.data(), header.size());
@@ -322,15 +341,18 @@ std::vector<char> encode_on_cpu(const Falcons::Config &conf, const PlanParams &p
 }
 
 template <class T>
-std::vector<char> compress_hybrid(const Falcons::Config &config, const T *data, int streams, CompressTimes *times = nullptr) {
+std::vector<char> compress_hybrid(const Falcons::Config &config, const T *data, int streams, CompressTimes *times = nullptr, const void *deviceData = nullptr,
+                                  CompressOutput *scratch = nullptr) {
     using namespace Falcons;
     PlanParams pp;
-    Config conf = prepare_compress<T>(config, data, streams, pp);
+    Config conf = prepare_compress<T>(config, data, streams, pp, deviceData);
     Plan plan = build_plan(pp);
     CompressInput ci;
     ci.plan = &plan;
     ci.sizeT = sizeof(T);
-    CompressOutput co;
+    ci.deviceData = deviceData;
+    CompressOutput local;
+    CompressOutput &co = scratch ? *scratch : local;
     compress_gpu(ci, data, co);
     if (!co.ok) return {};
     if (times) {

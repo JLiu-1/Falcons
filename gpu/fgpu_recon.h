@@ -25,6 +25,7 @@ struct ReconInput {
 struct CompressInput {
     const Plan *plan = nullptr;
     size_t sizeT = 4;
+    const void *deviceData = nullptr;   // source array already in device memory; skips the upload
 };
 
 struct CompressOutput {
@@ -101,9 +102,14 @@ struct PureInput {
 // hybrid decoder: rejectMethod1 was set, or zstd did not cut its frames at 128 KB.
 bool decode_pure(const PureInput &in, void *out, PureTiming *t, void **device = nullptr);
 
+void *upload(const void *src, size_t bytes);   // copies to new device memory, released with free_device
 void free_device(void *p);
 void trim_pool();   // returns cached device blocks to the driver
 void download(void *dst, const void *device, size_t bytes);
+
+// max - min of a device array, computed in the element type like the CPU's data_range. NaNs are
+// skipped, and the result is 0 when every value is NaN.
+double device_range(const void *device, size_t count, size_t sizeT);
 
 // Reconstructs into device memory and, if out is non-null, downloads to out. If device is
 // non-null it receives the array in device memory, released with free_device.

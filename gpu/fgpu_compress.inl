@@ -12,6 +12,43 @@ struct EscEntry {
 };
 
 template <class T>
+struct Extrema {
+    T lo, hi;
+};
+
+template <class T>
+struct ToExtrema {
+    __host__ __device__ Extrema<T> operator()(T v) const {
+        const T inf = std::numeric_limits<T>::infinity();
+        return v == v ? Extrema<T>{v, v} : Extrema<T>{inf, -inf};
+    }
+};
+
+template <class T>
+struct MergeExtrema {
+    __host__ __device__ Extrema<T> operator()(const Extrema<T> &a, const Extrema<T> &b) const {
+        return {a.lo < b.lo ? a.lo : b.lo, a.hi > b.hi ? a.hi : b.hi};
+    }
+};
+
+template <class T>
+double range_of(const void *device, size_t count) {
+    const T inf = std::numeric_limits<T>::infinity();
+    auto first = thrust::device_pointer_cast(const_cast<T *>(static_cast<const T *>(device)));
+    const Extrema<T> e = thrust::transform_reduce(first, first + count, ToExtrema<T>(), Extrema<T>{inf, -inf}, MergeExtrema<T>());
+    return e.lo > e.hi ? 0 : static_cast<T>(e.hi - e.lo);
+}
+
+// cudaMemcpy into untouched memory faults every page in on one thread, which costs far more than the copy.
+template <class V>
+void touch_pages(V &v) {
+    auto *p = reinterpret_cast<volatile char *>(v.data());
+    const size_t bytes = v.size() * sizeof(v[0]);
+#pragma omp parallel for
+    for (size_t i = 0; i < bytes; i += 4096) p[i] = 0;
+}
+
+template <class T>
 struct EscLess {
     __host__ __device__ bool operator()(const EscEntry<T> &a, const EscEntry<T> &b) const { return a.pos < b.pos; }
 };
@@ -120,13 +157,16 @@ void compress_codes(const CompressInput &in, const T *src, CompressOutput &co) {
     for (auto l : P.streamLen) nstream += l;
     for (auto l : P.anchorLen) nanchor += l;
     QuantState<T> q(P, nstream, nanchor);
-    run_quant<T>(P, src, nullptr, q);
+    run_quant<T>(P, src, in.deviceData, q);
     co.ok = q.ok;
     co.upload = q.upload;
     co.quant = q.quant;
     if (!q.ok) return;
     auto t0 = Clock::now();
-    co.codes.resize(nstream);
+    if (co.codes.size() != nstream) {
+        co.codes.resize(nstream);
+        touch_pages(co.codes);
+    }
     co.anchors.resize(nanchor * sizeof(T));
     co.escPos.resize(q.numEsc);
     co.escVal.resize(q.numEsc * sizeof(T));
@@ -184,6 +224,7 @@ void compress_pure_impl(const PureCompressInput &in, const T *src, PureCompressO
         c.upload = q.upload;
         c.quant = q.quant;
         c.codes.resize(nstream);
+        touch_pages(c.codes);
         c.anchors.resize(nanchor * sizeof(T));
         c.escPos.resize(q.numEsc);
         c.escVal.resize(q.numEsc * sizeof(T));
@@ -453,6 +494,10 @@ void compress_pure_impl(const PureCompressInput &in, const T *src, PureCompressO
 }
 
 }  // namespace
+
+double device_range(const void *device, size_t count, size_t sizeT) {
+    return sizeT == 4 ? range_of<float>(device, count) : range_of<double>(device, count);
+}
 
 void compress_gpu(const CompressInput &in, const void *data, CompressOutput &out) {
     if (in.sizeT == 4) compress_codes<float>(in, static_cast<const float *>(data), out);

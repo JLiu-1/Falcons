@@ -10,6 +10,7 @@
 #include <thrust/count.h>
 #include <thrust/scan.h>
 #include <thrust/sort.h>
+#include <thrust/transform_reduce.h>
 #include <thrust/device_ptr.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <chrono>
@@ -17,6 +18,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -307,6 +309,13 @@ void run(const ReconInput &in, void *out, Timing *tm, void **device) {
 void reconstruct(const ReconInput &in, void *out, Timing *t, void **device) {
     if (in.sizeT == 4) run<float>(in, out, t, device);
     else run<double>(in, out, t, device);
+}
+
+void *upload(const void *src, size_t bytes) {
+    void *p = nullptr;
+    CK(cudaMalloc(&p, bytes));
+    CK(cudaMemcpy(p, src, bytes, cudaMemcpyHostToDevice));
+    return p;
 }
 
 void free_device(void *p) { cudaFree(p); }

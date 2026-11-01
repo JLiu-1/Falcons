@@ -1,5 +1,7 @@
 // Differential test: CPU-compress, CPU-decompress, GPU-decompress, compare bytes.
 #include <omp.h>
+#include <cmath>
+#include <limits>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -47,7 +49,7 @@ struct Case {
 };
 
 static fgpu::PureTiming cover;
-static int failures = 0, passed = 0, skipped = 0, compressed = 0, pureCompressed = 0;
+static int failures = 0, passed = 0, skipped = 0, compressed = 0, pureCompressed = 0, fromDevice = 0;
 
 template <class T>
 void one(const Case &c, unsigned seed) {
@@ -97,6 +99,34 @@ void one(const Case &c, unsigned seed) {
             failures++;
         } else {
             compressed++;
+        }
+        {   // starting from device memory changes nothing, relative bounds included
+            const size_t bytes = data.size() * sizeof(T);
+            void *dev = fgpu::upload(data.data(), bytes);
+            Falcons::Config rel(conf);
+            rel.errorBoundMode = Falcons::EB_REL;
+            rel.relErrorBound = 1e-3;
+            const auto same = [&](const char *what, const std::vector<char> &a, const std::vector<char> &b) {
+                if (a == b) {
+                    fromDevice++;
+                } else {
+                    printf("FAIL device %s %s: %zu vs %zu bytes\n", what, desc, a.size(), b.size());
+                    failures++;
+                }
+            };
+            same("hybrid", fgpu::compress_hybrid<T>(conf, nullptr, c.threads, nullptr, dev), g);
+            static fgpu::CompressOutput scratch;   // left over from another case on purpose
+            same("hybrid scratch", fgpu::compress_hybrid<T>(conf, nullptr, c.threads, nullptr, dev, &scratch), g);
+            same("hybrid rel", fgpu::compress_hybrid<T>(rel, nullptr, c.threads, nullptr, dev), fgpu::compress_hybrid<T>(rel, data.data(), c.threads));
+            same("pure", fgpu::compress_pure_stream<T>(conf, nullptr, c.threads, 4, nullptr, dev), fgpu::compress_pure_stream<T>(conf, data.data(), c.threads));
+            same("pure rel", fgpu::compress_pure_stream<T>(rel, nullptr, c.threads, 4, nullptr, dev), fgpu::compress_pure_stream<T>(rel, data.data(), c.threads));
+            std::vector<T> after(data.size());
+            fgpu::download(after.data(), dev, bytes);
+            if (std::memcmp(after.data(), data.data(), bytes) != 0) {
+                printf("FAIL device array changed %s\n", desc);
+                failures++;
+            }
+            fgpu::free_device(dev);
         }
         for (int chains : {4, 16}) {
             auto pg = fgpu::compress_pure_stream<T>(conf, data.data(), c.threads, chains);
@@ -199,6 +229,60 @@ void one(const Case &c, unsigned seed) {
     }
 }
 
+// Device-memory compression on data whose value range needs care.
+template <class T>
+void edge() {
+    const std::vector<size_t> dims = {64, 64, 64};
+    const size_t n = 64 * 64 * 64;
+    Falcons::Config rel;
+    rel.setDims(dims.begin(), dims.end());
+    rel.cmprAlgo = Falcons::ALGO_INTERP;
+    rel.errorBoundMode = Falcons::EB_REL;
+    rel.relErrorBound = 1e-3;
+    rel.openmp = true;
+    omp_set_num_threads(8);
+
+    std::vector<T> flat(n, T(3.25));
+    void *dev = fgpu::upload(flat.data(), n * sizeof(T));
+    if (fgpu::compress_hybrid<T>(rel, nullptr, 8, nullptr, dev) == fgpu::compress_hybrid<T>(rel, flat.data(), 8)) {
+        fromDevice++;
+    } else {
+        puts("FAIL device constant field");
+        failures++;
+    }
+    fgpu::free_device(dev);
+
+    auto data = field<T>(dims, 7, 0, 0.02);
+    T lo = data[0], hi = data[0];
+    for (T v : data) {
+        lo = std::min(lo, v);
+        hi = std::max(hi, v);
+    }
+    const double eb = rel.relErrorBound * (hi - lo);
+    for (size_t i = 0; i < n; i += 997) data[i] = std::numeric_limits<T>::quiet_NaN();
+    dev = fgpu::upload(data.data(), n * sizeof(T));
+    if (std::fabs(fgpu::device_range(dev, n, sizeof(T)) / (hi - lo) - 1) > 1e-3) {
+        puts("FAIL device range with NaNs");
+        failures++;
+    }
+    for (bool pure : {false, true}) {
+        auto c = pure ? fgpu::compress_pure_stream<T>(rel, nullptr, 8, 4, nullptr, dev) : fgpu::compress_hybrid<T>(rel, nullptr, 8, nullptr, dev);
+        std::vector<T> out(n);
+        T *op = out.data();
+        Falcons::Config dc;
+        Falcons_decompress<T>(dc, c.data(), c.size(), op);
+        size_t bad = 0;
+        for (size_t i = 0; i < n; ++i) bad += std::isnan(data[i]) ? !std::isnan(out[i]) : std::fabs(double(data[i]) - out[i]) > eb * (1 + 1e-6);
+        if (bad) {
+            printf("FAIL device NaN field pure=%d: %zu bad points\n", pure, bad);
+            failures++;
+        } else {
+            fromDevice++;
+        }
+    }
+    fgpu::free_device(dev);
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     int maxCases = argc > 1 ? atoi(argv[1]) : 1000000;
@@ -246,8 +330,12 @@ int main(int argc, char **argv) {
         one<float>(c, seed++);
         one<double>(c, seed++);
     }
+    if (FGPU_AVX) {
+        edge<float>();
+        edge<double>();
+    }
     printf("coverage: method1 %d delta %d zstd-blocks %d ovf raw/coded %d/%d fse raw/rle/coded %d/%d/%d\n", cover.method1, cover.delta,
            cover.zstdBlocks, cover.ovfRaw, cover.ovfCoded, cover.fseRaw, cover.fseRle, cover.fseCoded);
-    printf("passed %d failed %d skipped %d, gpu compress identical %d, pure-gpu compress decoded by cpu %d\n", passed, failures, skipped, compressed, pureCompressed);
+    printf("passed %d failed %d skipped %d, gpu compress identical %d, pure-gpu compress decoded by cpu %d, from device memory %d\n", passed, failures, skipped, compressed, pureCompressed, fromDevice);
     return failures != 0;
 }

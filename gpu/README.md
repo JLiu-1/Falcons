@@ -49,8 +49,19 @@ dequantization into FMA and the output stops matching the CPU.
     fgpu_decode   -i data.falcons -d -c reference.raw        # byte-compare
 
 From code, pass `device` to `decode_pure` or `reconstruct` to keep the array in device memory, and
-`deviceData` to `compress_pure_stream` to compress an array already there. Moving data over PCIe is the
-slow part: 512^3 floats take about 23 ms each way.
+`deviceData` to compress an array already there. Moving data over PCIe is the slow part: 512^3 floats take
+about 23 ms each way.
+
+    fgpu::CompressOutput scratch;   // reused between calls
+    auto a = fgpu::compress_hybrid<float>(conf, nullptr, 32, nullptr, device, &scratch);
+    auto b = fgpu::compress_pure_stream<float>(conf, nullptr, 32, 4, nullptr, device);
+
+Both return the stream in host memory and leave the device array unchanged, using device memory for a working
+copy. You choose the path: there is no automatic fallback, and an empty result means the data is nearly
+incompressible. Hybrid downloads 2 bytes per point and encodes on the CPU, and `scratch` saves it 30 ms per call
+at 512^3 at the cost of keeping that buffer. Relative bounds take the value range from the device array, skipping
+NaNs. The CPU's range on data with NaNs depends on where they fall, so hybrid is byte-identical to the CPU
+compressor except in that case.
 
 `--scalar-stream` is only for 1.0.0 `-P` streams written by a non-AVX build. Version 1.0.1 streams do not
 depend on the build that wrote them. SVE2-built `-P` streams are not supported.
@@ -77,6 +88,19 @@ oversubscription to read it, so prefer it for data that stays on the GPU.
 
 Compression at REL 1e-3: CPU 33 ms, GPU pure 40 ms from host memory, of which 23 ms is the upload. On
 4.2 billion points (Basilisk, 16.8 GB): CPU 651 ms, GPU about 105 ms plus upload; decode 715 ms against 145 ms.
+
+Compressing an array already in device memory, ending with the stream in host memory, 32 threads, median of
+6 runs in one process on a shared machine. The CPU path downloads the array first. Going from 32 to 64 CPU
+threads gave no gain.
+
+| Data, REL | Ratio | download + CPU | `compress_hybrid` with `scratch` | `compress_pure_stream` |
+| --- | --- | --- | --- | --- |
+| f32, 1e-3 | 75.0 | 60 ms | **21 ms** | 23 ms |
+| f32, 1e-4 | 15.8 | 69 ms | **54 ms** | 295 ms |
+| f32, 1e-5 | 6.5 | **78 ms** | 83 ms | 403 ms |
+| f32, 1e-6 | 3.8 | **94 ms** | 125 ms | 451 ms |
+| f64, 1e-3 | 149.7 | 110 ms | **26 ms** | 48 ms |
+| f64, 1e-5 | 12.9 | 118 ms | **85 ms** | 399 ms |
 
 ## How it works
 

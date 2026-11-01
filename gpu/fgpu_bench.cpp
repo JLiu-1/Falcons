@@ -53,6 +53,30 @@ int run(const char *path, std::vector<size_t> dims, double rel, int threads, int
             printf("pure compress K=%d: %.1f ms (upload %.1f quant %.1f rle %.1f fse %.1f tans %.1f assemble %.1f) size %zu\n", chains, ms(c1, Clock::now()), ct.upload, ct.quant, ct.rle,
                    ct.fse, ct.tans, ct.assemble, g.size());
         }
+    {   // the array already in device memory, ending with the stream in host memory
+        void *dev = fgpu::upload(data.data(), num * sizeof(T));
+        fgpu::CompressOutput scratch;
+        for (int r = 0; r < reps; ++r) {
+            auto c1 = Clock::now();
+            fgpu::download(copy.data(), dev, num * sizeof(T));
+            auto c2 = Clock::now();
+            Falcons_compress(conf, copy.data(), cbuf.data(), cbuf.size());
+            printf("device to cpu compress: %.1f ms (download %.1f compress %.1f)\n", ms(c1, Clock::now()), ms(c1, c2), ms(c2, Clock::now()));
+            fgpu::CompressTimes ct;
+            c1 = Clock::now();
+            auto g = fgpu::compress_hybrid<T>(conf, nullptr, threads, &ct, dev, &scratch);
+            printf("device hybrid compress: %.1f ms (quant %.1f gather %.1f) identical %s\n", ms(c1, Clock::now()), ct.quant, ct.gather,
+                   g.size() == csize && !std::memcmp(g.data(), cbuf.data(), csize) ? "yes" : "NO");
+        }
+        for (int r = 0; r < reps; ++r) {
+            fgpu::PureCompressOutput ct;
+            auto c1 = Clock::now();
+            auto g = fgpu::compress_pure_stream<T>(conf, nullptr, threads, 4, &ct, dev);
+            printf("device pure compress: %.1f ms (quant %.1f rle %.1f fse %.1f tans %.1f assemble %.1f) size %zu\n", ms(c1, Clock::now()), ct.quant, ct.rle, ct.fse, ct.tans,
+                   ct.assemble, g.size());
+        }
+        fgpu::free_device(dev);
+    }
     if (getenv("FGPU_TUNED")) {   // streams written by the GPU for the GPU
         for (auto [K, chains] : {std::pair<int, int>{32, 4}, {32, 16}, {128, 4}, {128, 16}}) {
             auto g = fgpu::compress_pure_stream<T>(conf, data.data(), K, chains);
